@@ -6,10 +6,6 @@ on:
       shards:
         description: "number of shards"
         default: "20"
-  push:
-    branches:
-      - "snorkell_ai/config_9a040"
-      - main
 
 permissions:
   contents: read
@@ -156,6 +152,8 @@ jobs:
           path: results
           merge-multiple: true
       - name: Build report
+        env:
+          ALCHEMY_API_KEY: ${{ secrets.ALCHEMY_API_KEY }}
         run: python tools/build_report.py --results results --out report --min-usd 1
       - uses: actions/upload-artifact@v4
         if: always()

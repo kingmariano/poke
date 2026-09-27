@@ -1,14 +1,14 @@
-"""Aggregate shard results, price balances, and build the consolidated report.
+"""Aggregate shard results, price balances with the Alchemy Prices API, build report.
+
+Simple, single-provider pricing:
+  * token decimals/symbols  -> JSON-RPC alchemy_getTokenMetadata (batched)
+  * token prices            -> POST /prices/v1/{key}/tokens/by-address (batched)
+  * native prices           -> POST /prices/v1/{key}/tokens/by-symbol
+  * any asset without a returned price is EXCLUDED and recorded as spam/unpriced
 
 Input : results/shard-*.csv(.gz) produced by check_balances.py (partials welcome)
 Output: report/report.csv.gz, report/summary.json, report/report.md,
-        report/filtered.csv.gz (unpriced / low-confidence entries),
-        report/results.zip (all shard files + report bundled together)
-
-Pricing quality:
-  * tokens require a resolved price with confidence >= --min-confidence
-  * natives are priced via the wrapped-native market, with a coingecko fallback
-  * dropped/unknown entries are written to filtered.csv.gz with a reason
+        report/excluded.csv.gz, report/results.zip (everything bundled)
 """
 
 import argparse
@@ -27,27 +27,26 @@ try:  # allow execution as a plain script and as a module
 except ImportError:  # pragma: no cover
     from networks import NETWORKS
 
-PRICE_URL = "https://coins.llama.fi/prices/current/"
+PRICES_BASE = "https://api.g.alchemy.com/prices/v1"
+ADDR_BATCH = 25
+SYMBOL_BATCH = 25
+RPC_BATCH = 50
 
-# fallbacks for native assets (used when the wrapped-native lookup fails)
-NATIVE_CG = {
-    "ethereum": "ethereum", "optimism": "ethereum", "base": "ethereum", "arbitrum": "ethereum",
-    "linea": "ethereum", "scroll": "ethereum", "era": "ethereum", "blast": "ethereum",
-    "unichain": "ethereum", "worldchain": "ethereum", "soneium": "ethereum", "ink": "ethereum",
-    "abstract": "ethereum", "shape": "ethereum", "zora": "ethereum", "bob": "ethereum",
-    "bsc": "binancecoin", "op_bnb": "binancecoin", "avax": "avalanche-2",
-    "polygon": "polygon-ecosystem-token", "xdai": "xdai", "celo": "celo", "ronin": "ronin",
-    "mantle": "mantle", "moonbeam": "moonbeam", "metis": "metis-token", "rootstock": "rootstock",
-    "zetachain": "zetachain", "sei": "sei-network", "astar": "astar", "sonic": "sonic-3",
-    "berachain": "berachain-bera", "apechain": "apecoin", "story": "story-2",
-    "kaia": "kaia", "tempo": "tempo", "monad": "monad",
+# native symbol per network slug (for the by-symbol price lookup)
+NATIVE_SYMBOL = {
+    "ethereum": "ETH", "optimism": "ETH", "base": "ETH", "arbitrum": "ETH", "linea": "ETH",
+    "scroll": "ETH", "era": "ETH", "blast": "ETH", "unichain": "ETH", "worldchain": "ETH",
+    "soneium": "ETH", "ink": "ETH", "abstract": "ETH", "shape": "ETH", "zora": "ETH", "bob": "ETH",
+    "bsc": "BNB", "op_bnb": "BNB", "avax": "AVAX", "polygon": "POL", "xdai": "XDAI",
+    "celo": "CELO", "ronin": "RON", "mantle": "MNT", "moonbeam": "GLMR", "metis": "METIS",
+    "rootstock": "RBTC", "zetachain": "ZETA", "sei": "SEI", "astar": "ASTR", "sonic": "S",
+    "berachain": "BERA", "apechain": "APE", "story": "IP", "kaia": "KAIA", "monad": "MON",
+    "tempo": "TEMPO",
 }
 
 
 def open_any(path):
-    if path.endswith(".gz"):
-        return gzip.open(path, "rt")
-    return open(path, "rt")
+    return gzip.open(path, "rt") if path.endswith(".gz") else open(path, "rt")
 
 
 def load_rows(paths):
@@ -79,17 +78,113 @@ def load_rows(paths):
     return agg, rows
 
 
-def fetch_prices(keys):
+def _post(url, payload, retries=6):
+    data = json.dumps(payload).encode()
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=90) as r:
+                return json.load(r)
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                time.sleep(min(30, 3 * (attempt + 1)))
+                continue
+            if e.code >= 500:
+                time.sleep(min(20, 2 ** attempt))
+                continue
+            return {}
+        except Exception:  # noqa: BLE001
+            time.sleep(min(20, 2 ** attempt))
+    return {}
+
+
+def _rpc(api_key, network, calls, retries=6):
+    url = f"https://{network}.g.alchemy.com/v2/{api_key}"
+    payload = [dict(c, jsonrpc="2.0", id=i) for i, c in enumerate(calls)]
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(url, data=json.dumps(payload).encode(),
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=90) as r:
+                data = json.load(r)
+            if isinstance(data, list):
+                out = [None] * len(calls)
+                for item in data:
+                    i = item.get("id")
+                    if isinstance(i, int) and 0 <= i < len(calls):
+                        out[i] = item.get("result")
+                return out
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                time.sleep(min(30, 3 * (attempt + 1)))
+                continue
+            if e.code >= 500:
+                time.sleep(min(20, 2 ** attempt))
+                continue
+            return []
+        except Exception:  # noqa: BLE001
+            time.sleep(min(20, 2 ** attempt))
+    return []
+
+
+def token_metadata(api_key, pairs):
+    """pairs: set of (network, token) -> {(network, token): {"symbol","decimals"}}"""
     out = {}
-    for i in range(0, len(keys), 100):
-        url = PRICE_URL + ",".join(keys[i:i + 100])
-        for attempt in range(4):
+    by_net = defaultdict(list)
+    for net, tok in pairs:
+        by_net[net].append(tok)
+    for net, toks in by_net.items():
+        for i in range(0, len(toks), RPC_BATCH):
+            chunk = toks[i:i + RPC_BATCH]
+            res = _rpc(api_key, net, [{"method": "alchemy_getTokenMetadata", "params": [t]} for t in chunk])
+            for t, m in zip(chunk, res):
+                if isinstance(m, dict):
+                    out[(net, t)] = {"symbol": m.get("symbol") or t[:10],
+                                     "decimals": int(m.get("decimals") or 0)}
+    return out
+
+
+def token_prices(api_key, pairs):
+    """prices via Alchemy Prices API by-address -> {(network, token): price}"""
+    url = f"{PRICES_BASE}/{api_key}/tokens/by-address"
+    out = {}
+    items = sorted(pairs)
+    for i in range(0, len(items), ADDR_BATCH):
+        chunk = items[i:i + ADDR_BATCH]
+        resp = _post(url, {"addresses": [{"network": n, "address": t} for n, t in chunk]})
+        for entry in resp.get("data") or []:
+            net, tok = entry.get("network"), (entry.get("address") or "").lower()
+            for p in entry.get("prices") or []:
+                if p.get("currency") == "usd" and p.get("value"):
+                    out[(net, tok)] = float(p["value"])
+                    break
+    return out
+
+
+def native_prices(api_key, symbols):
+    """native prices via Alchemy Prices API by-symbol (GET; POST is not allowed)"""
+    out = {}
+    syms = sorted(symbols)
+    for i in range(0, len(syms), SYMBOL_BATCH):
+        url = f"{PRICES_BASE}/{api_key}/tokens/by-symbol?symbols=" + ",".join(syms[i:i + SYMBOL_BATCH])
+        for attempt in range(6):
             try:
                 with urllib.request.urlopen(url, timeout=90) as r:
-                    out.update(json.load(r).get("coins") or {})
+                    resp = json.load(r)
+                for entry in resp.get("data") or []:
+                    sym = (entry.get("symbol") or "").upper()
+                    for p in entry.get("prices") or []:
+                        if p.get("currency") == "usd" and p.get("value"):
+                            out[sym] = float(p["value"])
+                            break
+                break
+            except urllib.error.HTTPError as e:
+                if e.code == 429 or e.code >= 500:
+                    time.sleep(min(30, 3 * (attempt + 1)))
+                    continue
                 break
             except Exception:  # noqa: BLE001
-                time.sleep(2 + attempt * 2)
+                time.sleep(min(20, 2 ** attempt))
     return out
 
 
@@ -98,8 +193,11 @@ def main(argv=None):
     ap.add_argument("--results", default="results")
     ap.add_argument("--out", default="report")
     ap.add_argument("--min-usd", type=float, default=1.0)
-    ap.add_argument("--min-confidence", type=float, default=0.5)
     args = ap.parse_args(argv)
+
+    api_key = os.environ.get("ALCHEMY_API_KEY")
+    if not api_key:
+        raise SystemExit("ALCHEMY_API_KEY not set")
 
     paths = sorted(glob.glob(os.path.join(args.results, "shard-*.csv")) +
                    glob.glob(os.path.join(args.results, "shard-*.csv.gz")))
@@ -108,65 +206,49 @@ def main(argv=None):
     agg, total_rows = load_rows(paths)
     print(f"loaded {total_rows} rows across {len(paths)} shards; {len(agg)} addresses with balances")
 
-    price_keys = set()
-    for net, cfg in NETWORKS.items():
-        if cfg["wrapped"]:
-            price_keys.add(f"{cfg['slug']}:{cfg['wrapped']}")
-        cg = NATIVE_CG.get(cfg["slug"])
-        if cg:
-            price_keys.add(f"coingecko:{cg}")
-    for a, rec in agg.items():
-        for net, toks in rec["tokens"].items():
-            cfg = NETWORKS.get(net)
-            if cfg:
-                for t, _v in toks:
-                    price_keys.add(f"{cfg['slug']}:{t}")
-    prices = fetch_prices(sorted(price_keys))
-    print(f"prices resolved: {len(prices)}")
+    pairs = {(net, t) for rec in agg.values() for net, toks in rec["tokens"].items() for t, _ in toks}
+    symbols = {NATIVE_SYMBOL[NETWORKS[net]["slug"]] for rec in agg.values()
+               for net in rec["native"] if net in NETWORKS and NETWORKS[net]["slug"] in NATIVE_SYMBOL}
+    print(f"unique tokens: {len(pairs)}, native symbols: {sorted(symbols)}")
+
+    meta = token_metadata(api_key, pairs)
+    print(f"token metadata resolved: {len(meta)}/{len(pairs)}")
+    prices = token_prices(api_key, pairs)
+    print(f"token prices resolved: {len(prices)}/{len(pairs)}")
+    nat = native_prices(api_key, symbols)
+    print(f"native prices resolved: {len(nat)}/{len(symbols)}")
 
     os.makedirs(args.out, exist_ok=True)
-    rows, filtered = [], []
+    rows, excluded = [], []
     for a, rec in agg.items():
         n_usd, n_detail = 0.0, []
         for net, wei in rec["native"].items():
             cfg = NETWORKS.get(net)
             if not cfg:
                 continue
-            meta = None
-            if cfg["wrapped"]:
-                meta = prices.get(f"{cfg['slug']}:{cfg['wrapped']}")
-            if not meta and NATIVE_CG.get(cfg["slug"]):
-                meta = prices.get(f"coingecko:{NATIVE_CG[cfg['slug']]}")
-            meta = meta or {}
-            price, conf = meta.get("price"), meta.get("confidence", 1.0)
-            if not price or (conf is not None and conf < args.min_confidence):
-                filtered.append({"address": a, "network": net, "asset": "native",
-                                 "raw": str(wei), "reason": "native-unpriced"})
+            sym = NATIVE_SYMBOL.get(cfg["slug"])
+            price = nat.get(sym) if sym else None
+            if not price:
+                excluded.append({"address": a, "network": net, "asset": "native",
+                                 "raw": str(wei), "reason": "no-price"})
                 continue
-            usd = wei / 1e18 * float(price)
+            usd = wei / 1e18 * price
             n_usd += usd
             n_detail.append(f"{cfg['symbol']}:{wei/1e18:.6g}:{usd:.2f}")
 
         t_usd, t_detail = 0.0, []
         for net, toks in rec["tokens"].items():
-            cfg = NETWORKS.get(net)
-            if not cfg:
-                continue
             for t, raw in toks:
-                meta = prices.get(f"{cfg['slug']}:{t}") or {}
-                price, dec = meta.get("price"), meta.get("decimals")
-                conf = meta.get("confidence", 1.0)
-                if not price or dec is None:
-                    filtered.append({"address": a, "network": net, "asset": t,
-                                     "raw": str(raw), "reason": "unpriced-token"})
+                price = prices.get((net, t))
+                info = meta.get((net, t)) or {}
+                dec = info.get("decimals")
+                if price is None or dec is None:
+                    excluded.append({"address": a, "network": net, "asset": t,
+                                     "raw": str(raw), "reason": "spam-or-unpriced"})
                     continue
-                if conf is not None and conf < args.min_confidence:
-                    filtered.append({"address": a, "network": net, "asset": t,
-                                     "raw": str(raw), "reason": "low-confidence"})
-                    continue
-                usd = raw / (10 ** int(dec)) * float(price)
+                usd = raw / (10 ** int(dec)) * price
                 t_usd += usd
-                t_detail.append(f"{meta.get('symbol') or t[:10]}:{usd:.2f}")
+                t_detail.append(f"{info.get('symbol') or t[:10]}:{usd:.2f}")
 
         rows.append({
             "address": a,
@@ -188,37 +270,35 @@ def main(argv=None):
         w.writeheader()
         for r in selected:
             w.writerow(r)
-    with gzip.open(os.path.join(args.out, "filtered.csv.gz"), "wt") as f:
+    with gzip.open(os.path.join(args.out, "excluded.csv.gz"), "wt") as f:
         w = csv.DictWriter(f, fieldnames=["address", "network", "asset", "raw", "reason"])
         w.writeheader()
-        for r in filtered:
+        for r in excluded:
             w.writerow(r)
 
     summary = {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "pricing_source": "alchemy-prices",
         "shards": len(paths),
         "addresses_with_balances": len(agg),
         "addresses_above_threshold": len(selected),
         "threshold_usd": args.min_usd,
-        "min_confidence": args.min_confidence,
         "total_usd": round(total_usd, 2),
-        "filtered_entries": len(filtered),
+        "excluded_entries": len(excluded),
+        "tokens_priced": len(prices),
+        "tokens_seen": len(pairs),
         "top": selected[:100],
     }
     with open(os.path.join(args.out, "summary.json"), "w") as f:
         json.dump(summary, f, indent=1)
 
-    md = [
-        "# Consolidated balance report", "",
-        f"_Generated {summary['generated_at']}_", "",
-        f"- shards processed: **{len(paths)}**",
-        f"- addresses with non-zero balances: **{len(agg):,}**",
-        f"- above ${args.min_usd:.2f}: **{len(selected):,}**",
-        f"- total USD (priced, confidence >= {args.min_confidence}): **${total_usd:,.2f}**",
-        f"- filtered entries (unpriced/low-confidence): {len(filtered):,}", "",
-        "| # | address | USD | networks |",
-        "|---:|---|---:|---|",
-    ]
+    md = ["# Consolidated balance report", "", f"_Generated {summary['generated_at']}_ (priced via Alchemy)", "",
+          f"- shards processed: **{len(paths)}**",
+          f"- addresses with non-zero balances: **{len(agg):,}**",
+          f"- above ${args.min_usd:.2f}: **{len(selected):,}**",
+          f"- total USD: **${total_usd:,.2f}**",
+          f"- excluded (no price -> treated as spam/unpriced): {len(excluded):,}", "",
+          "| # | address | USD | networks |", "|---:|---|---:|---|"]
     for i, r in enumerate(selected[:100], 1):
         md.append(f"| {i} | {r['address']} | ${r['total_usd']:,.2f} | {r['networks']} |")
     md.append("")
@@ -228,7 +308,7 @@ def main(argv=None):
     with zipfile.ZipFile(os.path.join(args.out, "results.zip"), "w", zipfile.ZIP_DEFLATED) as z:
         for p in paths:
             z.write(p, os.path.basename(p))
-        for name in ("report.csv.gz", "filtered.csv.gz", "summary.json", "report.md"):
+        for name in ("report.csv.gz", "excluded.csv.gz", "summary.json", "report.md"):
             fp = os.path.join(args.out, name)
             if os.path.exists(fp):
                 z.write(fp, name)
