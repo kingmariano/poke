@@ -1,0 +1,118 @@
+name: address-balance-check
+
+on:
+  workflow_dispatch:
+    inputs:
+      shards:
+        description: "number of shards"
+        default: "20"
+  push:
+    branches:
+      - "snorkell_ai/config_9a040"
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: balance-check
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      shard_list: ${{ steps.fetch.outputs.shard_list }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Fetch dataset and build shards
+        id: fetch
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          DATASET_REPO: ${{ secrets.DATASET_REPO }}
+        run: |
+          python tools/fetch_data.py --repo "$DATASET_REPO" --shards "${{ inputs.shards || '20' }}" --out shards
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          m = json.load(open("shards/manifest.json"))
+          print("shard_list=" + json.dumps(list(range(m["shards"]))))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shards
+          path: shards/
+          retention-days: 30
+
+  check:
+    needs: fetch
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.fetch.outputs.shard_list) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - uses: actions/download-artifact@v4
+        with:
+          name: shards
+          path: shards
+      - name: Check balances
+        continue-on-error: true
+        env:
+          ALCHEMY_API_KEY: ${{ secrets.ALCHEMY_API_KEY }}
+        run: |
+          SHARD=$(printf '%02d' ${{ matrix.shard }})
+          mkdir -p results
+          for attempt in 1 2; do
+            python tools/check_balances.py \
+              --shard "shards/shard-$SHARD.txt.gz" \
+              --out "results/shard-${{ matrix.shard }}.csv" \
+              --stats "results/shard-${{ matrix.shard }}.json" \
+              --rps 15 --max-rate 60 --concurrency 8 --batch 100 --token-batch 50 && break
+            echo "attempt $attempt failed; retrying in 90s"; sleep 90
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results-${{ matrix.shard }}
+          path: results/
+          if-no-files-found: warn
+          retention-days: 30
+
+  report:
+    needs: check
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: results-*
+          path: results
+          merge-multiple: true
+      - name: Build report
+        run: python tools/build_report.py --results results --out report --min-usd 1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report
+          path: report/
+          retention-days: 30
