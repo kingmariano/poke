@@ -25,7 +25,10 @@ from typing import Dict, List, Optional
 
 import aiohttp
 
-from .networks import NETWORKS, TOKEN_CANDIDATES
+try:  # allow execution as a plain script and as a module
+    from .networks import NETWORKS, TOKEN_CANDIDATES
+except ImportError:  # pragma: no cover
+    from networks import NETWORKS, TOKEN_CANDIDATES
 
 PROBE_ADDRESS = "0x28C6c06298d514Db089934071355E5743bf21d60"
 

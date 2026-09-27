@@ -2,14 +2,19 @@
 
 Input : results/shard-*.csv(.gz) produced by check_balances.py (partials welcome)
 Output: report/report.csv.gz, report/summary.json, report/report.md,
+        report/filtered.csv.gz (unpriced / low-confidence entries),
         report/results.zip (all shard files + report bundled together)
+
+Pricing quality:
+  * tokens require a resolved price with confidence >= --min-confidence
+  * natives are priced via the wrapped-native market, with a coingecko fallback
+  * dropped/unknown entries are written to filtered.csv.gz with a reason
 """
 
 import argparse
 import csv
 import glob
 import gzip
-import io
 import json
 import os
 import time
@@ -17,9 +22,26 @@ import urllib.request
 import zipfile
 from collections import defaultdict
 
-from .networks import NETWORKS
+try:  # allow execution as a plain script and as a module
+    from .networks import NETWORKS
+except ImportError:  # pragma: no cover
+    from networks import NETWORKS
 
 PRICE_URL = "https://coins.llama.fi/prices/current/"
+
+# fallbacks for native assets (used when the wrapped-native lookup fails)
+NATIVE_CG = {
+    "ethereum": "ethereum", "optimism": "ethereum", "base": "ethereum", "arbitrum": "ethereum",
+    "linea": "ethereum", "scroll": "ethereum", "era": "ethereum", "blast": "ethereum",
+    "unichain": "ethereum", "worldchain": "ethereum", "soneium": "ethereum", "ink": "ethereum",
+    "abstract": "ethereum", "shape": "ethereum", "zora": "ethereum", "bob": "ethereum",
+    "bsc": "binancecoin", "op_bnb": "binancecoin", "avax": "avalanche-2",
+    "polygon": "polygon-ecosystem-token", "xdai": "xdai", "celo": "celo", "ronin": "ronin",
+    "mantle": "mantle", "moonbeam": "moonbeam", "metis": "metis-token", "rootstock": "rootstock",
+    "zetachain": "zetachain", "sei": "sei-network", "astar": "astar", "sonic": "sonic-3",
+    "berachain": "berachain-bera", "apechain": "apecoin", "story": "story-2",
+    "kaia": "kaia", "tempo": "tempo", "monad": "monad",
+}
 
 
 def open_any(path):
@@ -42,8 +64,7 @@ def load_rows(paths):
                 except ValueError:
                     wei = 0
                 if wei > 0:
-                    v = rec["native"].get(net, 0)
-                    rec["native"][net] = v + wei
+                    rec["native"][net] = rec["native"].get(net, 0) + wei
                 if r.get("tokens"):
                     toks = []
                     for part in r["tokens"].split("|"):
@@ -77,6 +98,7 @@ def main(argv=None):
     ap.add_argument("--results", default="results")
     ap.add_argument("--out", default="report")
     ap.add_argument("--min-usd", type=float, default=1.0)
+    ap.add_argument("--min-confidence", type=float, default=0.5)
     args = ap.parse_args(argv)
 
     paths = sorted(glob.glob(os.path.join(args.results, "shard-*.csv")) +
@@ -90,6 +112,9 @@ def main(argv=None):
     for net, cfg in NETWORKS.items():
         if cfg["wrapped"]:
             price_keys.add(f"{cfg['slug']}:{cfg['wrapped']}")
+        cg = NATIVE_CG.get(cfg["slug"])
+        if cg:
+            price_keys.add(f"coingecko:{cg}")
     for a, rec in agg.items():
         for net, toks in rec["tokens"].items():
             cfg = NETWORKS.get(net)
@@ -100,21 +125,29 @@ def main(argv=None):
     print(f"prices resolved: {len(prices)}")
 
     os.makedirs(args.out, exist_ok=True)
-    rows, unpriced = [], []
+    rows, filtered = [], []
     for a, rec in agg.items():
-        n_usd = 0.0
-        n_detail = []
+        n_usd, n_detail = 0.0, []
         for net, wei in rec["native"].items():
             cfg = NETWORKS.get(net)
-            if not cfg or not cfg["wrapped"]:
-                unpriced.append({"address": a, "network": net, "token": "native", "raw": str(wei)})
+            if not cfg:
                 continue
-            p = (prices.get(f"{cfg['slug']}:{cfg['wrapped']}") or {}).get("price") or 0.0
-            usd = wei / 1e18 * p
+            meta = None
+            if cfg["wrapped"]:
+                meta = prices.get(f"{cfg['slug']}:{cfg['wrapped']}")
+            if not meta and NATIVE_CG.get(cfg["slug"]):
+                meta = prices.get(f"coingecko:{NATIVE_CG[cfg['slug']]}")
+            meta = meta or {}
+            price, conf = meta.get("price"), meta.get("confidence", 1.0)
+            if not price or (conf is not None and conf < args.min_confidence):
+                filtered.append({"address": a, "network": net, "asset": "native",
+                                 "raw": str(wei), "reason": "native-unpriced"})
+                continue
+            usd = wei / 1e18 * float(price)
             n_usd += usd
             n_detail.append(f"{cfg['symbol']}:{wei/1e18:.6g}:{usd:.2f}")
-        t_usd = 0.0
-        t_detail = []
+
+        t_usd, t_detail = 0.0, []
         for net, toks in rec["tokens"].items():
             cfg = NETWORKS.get(net)
             if not cfg:
@@ -122,12 +155,19 @@ def main(argv=None):
             for t, raw in toks:
                 meta = prices.get(f"{cfg['slug']}:{t}") or {}
                 price, dec = meta.get("price"), meta.get("decimals")
+                conf = meta.get("confidence", 1.0)
                 if not price or dec is None:
-                    unpriced.append({"address": a, "network": net, "token": t, "raw": str(raw)})
+                    filtered.append({"address": a, "network": net, "asset": t,
+                                     "raw": str(raw), "reason": "unpriced-token"})
+                    continue
+                if conf is not None and conf < args.min_confidence:
+                    filtered.append({"address": a, "network": net, "asset": t,
+                                     "raw": str(raw), "reason": "low-confidence"})
                     continue
                 usd = raw / (10 ** int(dec)) * float(price)
                 t_usd += usd
                 t_detail.append(f"{meta.get('symbol') or t[:10]}:{usd:.2f}")
+
         rows.append({
             "address": a,
             "native_usd": round(n_usd, 2),
@@ -142,17 +182,16 @@ def main(argv=None):
     selected = [r for r in rows if r["total_usd"] > args.min_usd]
     total_usd = sum(r["total_usd"] for r in selected)
 
+    fields = ["address", "native_usd", "token_usd", "total_usd", "networks", "native_detail", "token_detail"]
     with gzip.open(os.path.join(args.out, "report.csv.gz"), "wt") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()) if rows else
-                           ["address", "native_usd", "token_usd", "total_usd", "networks",
-                            "native_detail", "token_detail"])
+        w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         for r in selected:
             w.writerow(r)
-    with gzip.open(os.path.join(args.out, "unpriced.csv.gz"), "wt") as f:
-        w = csv.DictWriter(f, fieldnames=["address", "network", "token", "raw"])
+    with gzip.open(os.path.join(args.out, "filtered.csv.gz"), "wt") as f:
+        w = csv.DictWriter(f, fieldnames=["address", "network", "asset", "raw", "reason"])
         w.writeheader()
-        for r in unpriced:
+        for r in filtered:
             w.writerow(r)
 
     summary = {
@@ -161,8 +200,9 @@ def main(argv=None):
         "addresses_with_balances": len(agg),
         "addresses_above_threshold": len(selected),
         "threshold_usd": args.min_usd,
+        "min_confidence": args.min_confidence,
         "total_usd": round(total_usd, 2),
-        "unpriced_entries": len(unpriced),
+        "filtered_entries": len(filtered),
         "top": selected[:100],
     }
     with open(os.path.join(args.out, "summary.json"), "w") as f:
@@ -174,8 +214,8 @@ def main(argv=None):
         f"- shards processed: **{len(paths)}**",
         f"- addresses with non-zero balances: **{len(agg):,}**",
         f"- above ${args.min_usd:.2f}: **{len(selected):,}**",
-        f"- total USD (priced): **${total_usd:,.2f}**",
-        f"- unpriced entries: {len(unpriced):,}", "",
+        f"- total USD (priced, confidence >= {args.min_confidence}): **${total_usd:,.2f}**",
+        f"- filtered entries (unpriced/low-confidence): {len(filtered):,}", "",
         "| # | address | USD | networks |",
         "|---:|---|---:|---|",
     ]
@@ -185,11 +225,10 @@ def main(argv=None):
     with open(os.path.join(args.out, "report.md"), "w") as f:
         f.write("\n".join(md))
 
-    # bundle everything
     with zipfile.ZipFile(os.path.join(args.out, "results.zip"), "w", zipfile.ZIP_DEFLATED) as z:
         for p in paths:
             z.write(p, os.path.basename(p))
-        for name in ("report.csv.gz", "unpriced.csv.gz", "summary.json", "report.md"):
+        for name in ("report.csv.gz", "filtered.csv.gz", "summary.json", "report.md"):
             fp = os.path.join(args.out, name)
             if os.path.exists(fp):
                 z.write(fp, name)
