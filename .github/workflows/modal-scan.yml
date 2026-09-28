@@ -1,0 +1,33 @@
+name: modal-scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "selftest | bench"
+        default: "selftest"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: modal-scan
+  cancel-in-progress: false
+
+jobs:
+  modal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Modal client
+        run: pip install modal
+      - name: Run on Modal GPU
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+        run: |
+          python -m modal run scanner/modal_scan.py::main --task "${{ inputs.task || 'selftest' }}"
