@@ -77,9 +77,10 @@ jobs:
           python - <<'PY'
           import json
           s = json.load(open("smoke/check.json"))
-          assert len(s.get("active", [])) >= 2, s
-          assert s.get("active_tokens"), s
-          print("validation ok:", s["active"])
+          nets = s.get("networks", {})
+          assert len(nets) >= 2, s
+          assert s.get("native_checked", 0) > 0, s
+          print("validation ok:", list(nets))
           PY
       - uses: actions/upload-artifact@v4
         if: always()
