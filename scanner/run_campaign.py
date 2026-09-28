@@ -42,29 +42,30 @@ def enumerate_shards(config):
     shard_keys = int(config.get("shard_keys", 4_000_000))
     for context in config.get("context_indexes", [0]):
         for math_offset in config.get("math_offsets", [0]):
-            total = (
-                int(config.get("seed_count", 0))
-                * len(config.get("t1_values", []))
-                * len(config.get("dt2_values", []))
-                * int(config.get("key_count", 1))
-            )
-            start = 0
-            while start < total:
-                count = min(shard_keys, total - start)
-                shards.append({
-                    "shard_id": f"c{context}-m{math_offset}-{start}-{count}",
-                    "seed_start": int(config["seed_start"]),
-                    "seed_count": int(config["seed_count"]),
-                    "context_index": int(context),
-                    "math_offset": int(math_offset),
-                    "key_count": int(config["key_count"]),
-                    "rc4_offset": int(config.get("rc4_offset", 0)),
-                    "t1_values": [int(v) for v in config["t1_values"]],
-                    "dt2_values": [int(v) for v in config["dt2_values"]],
-                    "flat_start": start,
-                    "flat_count": count,
-                })
-                start += count
+            for rc4_offset in config.get("rc4_offsets", [config.get("rc4_offset", 0)]):
+                total = (
+                    int(config.get("seed_count", 0))
+                    * len(config.get("t1_values", []))
+                    * len(config.get("dt2_values", []))
+                    * int(config.get("key_count", 1))
+                )
+                start = 0
+                while start < total:
+                    count = min(shard_keys, total - start)
+                    shards.append({
+                        "shard_id": f"c{context}-m{math_offset}-o{rc4_offset}-{start}-{count}",
+                        "seed_start": int(config["seed_start"]),
+                        "seed_count": int(config["seed_count"]),
+                        "context_index": int(context),
+                        "math_offset": int(math_offset),
+                        "key_count": int(config["key_count"]),
+                        "rc4_offset": int(rc4_offset),
+                        "t1_values": [int(v) for v in config["t1_values"]],
+                        "dt2_values": [int(v) for v in config["dt2_values"]],
+                        "flat_start": start,
+                        "flat_count": count,
+                    })
+                    start += count
     return shards
 
 
@@ -105,11 +106,16 @@ def init_campaign(name):
 
 
 def run_campaign(name, max_shards=1, budget_seconds=900, run_shard=None, index_bytes=None):
-    config = load_campaign(name)
+    config = name if isinstance(name, dict) else load_campaign(name)
     campaign_id = config["id"]
     manifest = scan_state.read_json(f"campaigns/{campaign_id}/manifest.json")
     if manifest is None:
-        manifest = init_campaign(name)
+        manifest = {"config": config, "shards": enumerate_shards(config),
+                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        scan_state.write_json(f"campaigns/{campaign_id}/manifest.json", manifest,
+                              f"campaign {campaign_id}: plan {len(manifest['shards'])} shards")
+    if isinstance(config, dict) and "extra" in config:
+        manifest.setdefault("extra", config["extra"])
     shards = manifest["shards"]
     done = scan_state.list_shard_results(campaign_id)
     pending = [s for s in shards if s["shard_id"] not in done]

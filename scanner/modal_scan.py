@@ -4,7 +4,8 @@
 Usage (from the repository root, via GitHub Actions or locally):
 
     modal run scanner/modal_scan.py::main --task selftest
-    modal run scanner/modal_scan.py::main --task campaign --campaign demo --max_shards 2
+    modal run scanner/modal_scan.py::main --task canary
+    modal run scanner/modal_scan.py::main --task campaign --campaign demo --max-shards 2
     modal run scanner/modal_scan.py::main --task campaign_status --campaign demo
 
 Scan state (campaign manifests, shard cursors, hits) is stored in the private
@@ -12,6 +13,8 @@ GitLab repository, never on Modal, so a campaign resumes across Modal accounts.
 """
 
 import json
+import multiprocessing
+import os
 import subprocess
 import sys
 import time
@@ -32,6 +35,36 @@ image = (
         "ls -la /root/scanner/chain/librandstorm_chain.so",
     )
 )
+
+_POOL = None
+
+
+def _get_pool():
+    """Fork-based worker pool created before any CUDA context exists."""
+    global _POOL
+    if _POOL is None:
+        workers = max(1, min(os.cpu_count() or 1, 8))
+        _POOL = multiprocessing.Pool(processes=workers)
+    return _POOL
+
+
+def _chain_chunk(task):
+    params, t1_values, dt2_values, start, count = task
+    import chain
+
+    return chain.generate(params, t1_values, dt2_values, start, count)
+
+
+def _split(count, parts):
+    base, remainder = divmod(count, parts)
+    chunks = []
+    offset = 0
+    for index in range(parts):
+        size = base + (1 if index < remainder else 0)
+        if size:
+            chunks.append((offset, size))
+        offset += size
+    return chunks
 
 
 @app.function(image=image, gpu="T4", timeout=3600)
@@ -58,6 +91,9 @@ def run_shard(spec_json: str, index_bytes: bytes, budget_seconds: int = 900):
     from ec import hash160, pubkey_bytes
 
     spec = json.loads(spec_json)
+    pool = _get_pool()  # created before CUDA initialisation
+    workers = pool._processes
+
     index_path = "/tmp/randstorm_index.bin"
     with open(index_path, "wb") as handle:
         handle.write(index_bytes)
@@ -75,16 +111,27 @@ def run_shard(spec_json: str, index_bytes: bytes, budget_seconds: int = 900):
     }
     t1_values = spec["t1_values"]
     dt2_values = spec["dt2_values"]
-    batch = 1 << 20
+    batch = 1 << 21
     done = 0
     hits = []
+    chain_seconds = 0.0
+    hunt_seconds = 0.0
     started = time.time()
 
     while done < spec["flat_count"] and time.time() - started < budget_seconds:
         count = min(batch, spec["flat_count"] - done)
-        keys_bytes, written = chain.generate(params, t1_values, dt2_values, spec["flat_start"] + done, count)
+        tasks = [
+            (params, t1_values, dt2_values, spec["flat_start"] + done + offset, size)
+            for offset, size in _split(count, workers)
+        ]
+        chain_started = time.time()
+        results = pool.map(_chain_chunk, tasks)
+        keys_bytes = b"".join(chunk[0] for chunk in results)
+        written = sum(chunk[1] for chunk in results)
+        chain_seconds += time.time() - chain_started
         if written == 0:
             break
+        hunt_started = time.time()
         limbs = hunt_cuda.limbs_from_bytes(keys_bytes)
         for key_int, kind in hunt_cuda.hunt_batch(limbs, gtab, db_gpu, n20, module):
             key_hex = f"{key_int:064x}"
@@ -97,8 +144,8 @@ def run_shard(spec_json: str, index_bytes: bytes, budget_seconds: int = 900):
                 "private_key": key_hex,
                 "type": kind,
                 "hash160": matched.hex(),
-                "flat": spec["flat_start"] + done,
             })
+        hunt_seconds += time.time() - hunt_started
         done += written
 
     elapsed = time.time() - started
@@ -109,6 +156,9 @@ def run_shard(spec_json: str, index_bytes: bytes, budget_seconds: int = 900):
         "finished": done >= spec["flat_count"],
         "elapsed_seconds": round(elapsed, 2),
         "keys_per_second": round(done / elapsed, 1) if elapsed else 0.0,
+        "chain_seconds": round(chain_seconds, 2),
+        "hunt_seconds": round(hunt_seconds, 2),
+        "workers": workers,
         "hits": hits,
     }
 
@@ -121,6 +171,23 @@ def main(task: str = "selftest", campaign: str = "", max_shards: int = 1, budget
         if payload["returncode"] != 0:
             print(payload["stderr"], file=sys.stderr)
             raise SystemExit(payload["returncode"])
+    elif task == "canary":
+        import canary
+        import run_campaign
+
+        victims = run_campaign.fetch_victims_index()
+        index_bytes, expected = canary.build_canary_index(victims)
+        print(f"canary index: {len(index_bytes):,} bytes, {len(expected)} canary records")
+        run_campaign.run_campaign(
+            canary.canary_config(),
+            max_shards=100,
+            budget_seconds=budget_seconds,
+            run_shard=run_shard,
+            index_bytes=index_bytes,
+        )
+        import scan_state
+
+        canary.verify_hits(scan_state, "canary", expected)
     elif task in ("campaign", "campaign_init", "campaign_status"):
         import run_campaign
 
