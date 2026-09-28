@@ -45,12 +45,16 @@ def compile_cuda(stride=1):
     import cupy as cp
 
     source = CUDA_SRC.replace("// @STRIDE_DEFINE@", f"#define STRIDE {stride}")
-    arch = _sm_arch()
-    attempts = [([f"-arch={arch}"], f"native {arch}"), ([], "cupy default arch")]
+    # CuPy injects its own --gpu-architecture for the active device, so we must
+    # not pass -arch ourselves; the PTX fallback is for older toolchains.
     errors = []
-    for options, description in attempts:
+    for description, ptx in (("cupy default arch", False), ("PTX fallback", True)):
         try:
-            module = cp.RawModule(code=source, options=tuple(options))
+            if ptx:
+                import cupy.cuda.compiler as _cp_compiler
+
+                _cp_compiler._use_ptx = True
+            module = cp.RawModule(code=source, options=())
             stack = stride * 128 + 64 * 1024
             if cp.cuda.runtime.deviceGetLimit(0) < stack:
                 cp.cuda.runtime.deviceSetLimit(0, stack)
