@@ -5,17 +5,17 @@ https://github.com/tongriyaotxt/gpu-keyhunt/blob/main/gpu_hunt.py
 """
 
 CUDA_SRC = r"""
-// @STRIDE_DEFINE@  // 主机编译时注入 #define STRIDE n（步进扫描长度，compile-time）
+// @STRIDE_DEFINE@  //  #define STRIDE ncompile-time
 
 typedef unsigned int u32;
 typedef unsigned long long u64;
 
-// secp256k1 域素数 P = 2^256 - 2^32 - 977（小端 limb）
+// secp256k1  P = 2^256 - 2^32 - 977 limb
 __device__ __forceinline__ u32 p_limb(int i) {
     return i == 0 ? 0xFFFFFC2Fu : (i == 1 ? 0xFFFFFFFEu : 0xFFFFFFFFu);
 }
 
-// P - 2 的小端 limb（费马小定理求逆指数）
+// P - 2  limb
 __device__ __forceinline__ u32 pm2_limb(int i) {
     return i == 0 ? 0xFFFFFC2Du : (i == 1 ? 0xFFFFFFFEu : 0xFFFFFFFFu);
 }
@@ -33,10 +33,10 @@ __device__ int fp_geq_p(const u32 a[8]) {
         u32 p = p_limb(i);
         if (a[i] != p) return a[i] > p;
     }
-    return 1;  // 相等也算 >=
+    return 1;  //  >=
 }
 
-__device__ void fp_sub_p(u32 r[8]) {  // 要求 r >= P
+__device__ void fp_sub_p(u32 r[8]) {  //  r >= P
     u64 bor = 0;
     #pragma unroll
     for (int i = 0; i < 8; i++) {
@@ -46,7 +46,7 @@ __device__ void fp_sub_p(u32 r[8]) {  // 要求 r >= P
     }
 }
 
-// r += C，其中 C = 2^32 + 977（因为 2^256 ≡ C (mod P)）。溢出 2^256 时再加一次 C。
+// r += C C = 2^32 + 977 2^256  C (mod P) 2^256  C
 __device__ void fp_add_c(u32 r[8]) {
     u64 c = 1;
     while (c) {
@@ -67,7 +67,7 @@ __device__ void fp_add(u32 r[8], const u32 a[8], const u32 b[8]) {
         u64 t = (u64)a[i] + b[i] + c;
         r[i] = (u32)t; c = t >> 32;
     }
-    if (c) fp_add_c(r);              // 2^256 ≡ C (mod P)
+    if (c) fp_add_c(r);              // 2^256  C (mod P)
     if (fp_geq_p(r)) fp_sub_p(r);
 }
 
@@ -79,7 +79,7 @@ __device__ void fp_sub(u32 r[8], const u32 a[8], const u32 b[8]) {
         r[i] = (u32)t;
         bor = (t >> 32) & 1ull;
     }
-    if (bor) {  // 借位：加回 P
+    if (bor) {  //  P
         u64 c = 0;
         #pragma unroll
         for (int i = 0; i < 8; i++) {
@@ -89,7 +89,7 @@ __device__ void fp_sub(u32 r[8], const u32 a[8], const u32 b[8]) {
     }
 }
 
-// 8x8 -> 16 limb 学校乘法（64 位累加器，逐行进位）
+// 8x8 -> 16 limb 64 
 __device__ void fp_mul_raw(u32 t[16], const u32 a[8], const u32 b[8]) {
     #pragma unroll
     for (int i = 0; i < 16; i++) t[i] = 0;
@@ -111,16 +111,16 @@ __device__ void fp_mul_raw(u32 t[16], const u32 a[8], const u32 b[8]) {
     }
 }
 
-// 伪梅森快速约减：2^256 ≡ C (mod P)，C = 2^32 + 977。
-// 反复把高 limb 折叠（乘 C 加回低位），直到高 limb 清零，最后一次条件减 P。
-// 收敛性：每轮 H -> H*C/2^256（缩小 2^223 倍），仅当低位贴近 2^256 时 H=1
-// 会再持续一两轮（低位每轮减 P），8 轮上界足够。
+// 2^256  C (mod P)C = 2^32 + 977
+//  limb  C  limb  P
+//  H -> H*C/2^256 2^223  2^256  H=1
+//  P8 
 __device__ void fp_reduce(u32 r[8], const u32 t[16]) {
     u32 v[10];
     #pragma unroll
     for (int i = 0; i < 8; i++) v[i] = t[i];
     v[8] = 0; v[9] = 0;
-    {   // 第一轮：H = t[8..15]，v += H*977 + (H << 32)
+    {   // H = t[8..15]v += H*977 + (H << 32)
         u64 c = 0;
         #pragma unroll
         for (int i = 0; i < 8; i++) {
@@ -137,10 +137,10 @@ __device__ void fp_reduce(u32 r[8], const u32 t[16]) {
             u64 a = (u64)v[i + 1] + t[8 + i] + c;
             v[i + 1] = (u32)a; c = a >> 32;
         }
-        if (c) { v[9] = (u32)((u64)v[9] + c); }  // 总量 < 2^289，不会再溢出
+        if (c) { v[9] = (u32)((u64)v[9] + c); }  //  < 2^289
     }
     #pragma unroll 1
-    for (int it = 0; it < 8; it++) {  // 后续轮：H 只剩 v[8..9]
+    for (int it = 0; it < 8; it++) {  // H  v[8..9]
         u32 h0 = v[8], h1 = v[9];
         if ((h0 | h1) == 0) break;
         v[8] = 0; v[9] = 0;
@@ -165,7 +165,7 @@ __device__ void fp_mul(u32 r[8], const u32 a[8], const u32 b[8]) {
 
 __device__ void fp_sqr(u32 r[8], const u32 a[8]) { fp_mul(r, a, a); }
 
-// 费马小定理：a^(P-2) mod P（通用位扫描，256 轮）
+// a^(P-2) mod P256 
 __device__ void fp_inv(u32 r[8], const u32 a[8]) {
     u32 res[8], base[8];
     res[0] = 1;
@@ -182,7 +182,7 @@ __device__ void fp_inv(u32 r[8], const u32 a[8]) {
     for (int i = 0; i < 8; i++) r[i] = res[i];
 }
 
-// 群阶 N 的小端 limb（k 溢出 mod N 用）
+//  N  limbk  mod N 
 __device__ __forceinline__ u32 n_limb(int i) {
     switch (i) {
         case 0: return 0xD0364141u;
@@ -203,7 +203,7 @@ __device__ int fp_geq_n(const u32 a[8]) {
     return 1;
 }
 
-__device__ void fp_sub_n(u32 r[8]) {  // 要求 r >= N
+__device__ void fp_sub_n(u32 r[8]) {  //  r >= N
     u64 bor = 0;
     #pragma unroll
     for (int i = 0; i < 8; i++) {
@@ -214,8 +214,8 @@ __device__ void fp_sub_n(u32 r[8]) {  // 要求 r >= N
 }
 
 // ------------------------------------------------------------------
-// Jacobian 坐标点运算（a=0），公式与 btc_key.py 的
-// _jacobian_double / _jacobian_add_mixed / _jacobian_to_affine 一致
+// Jacobian a=0 btc_key.py 
+// _jacobian_double / _jacobian_add_mixed / _jacobian_to_affine 
 // ------------------------------------------------------------------
 __device__ void jac_double(u32 X[8], u32 Y[8], u32 Z[8], int* inf) {
     if (*inf || fp_iszero(Y)) { *inf = 1; return; }
@@ -251,7 +251,7 @@ __device__ void jac_add_mixed(u32 X[8], u32 Y[8], u32 Z[8], int* inf,
     fp_sub(rr, s2, Y);
     if (fp_iszero(h)) {
         if (fp_iszero(rr)) { jac_double(X, Y, Z, inf); return; }
-        *inf = 1; return;  // 结果为无穷远点
+        *inf = 1; return;  // 
     }
     u32 hh[8], hhh[8], x1hh[8], x3[8], y3[8];
     fp_sqr(hh, h);
@@ -269,8 +269,8 @@ __device__ void jac_add_mixed(u32 X[8], u32 Y[8], u32 Z[8], int* inf,
     for (int i = 0; i < 8; i++) { X[i] = x3[i]; Y[i] = y3[i]; }
 }
 
-// k*G（Jacobian，不转仿射）：4-bit 窗口 x 64 窗，表在全局内存
-//（64*16 个仿射点，每点 x||y 各 8 limb）。调用方保证 k != 0。
+// k*GJacobian4-bit  x 64 
+//64*16  x||y  8 limb k != 0
 __device__ void jac_mul_g(const u32 k[8], const u32* gtab,
                           u32 X[8], u32 Y[8], u32 Z[8], int* inf) {
     *inf = 1;
@@ -284,7 +284,7 @@ __device__ void jac_mul_g(const u32 k[8], const u32* gtab,
     }
 }
 
-// k*G 并转仿射（自检用；正式 kernel 走 Montgomery 批量求逆）
+// k*G  kernel  Montgomery 
 __device__ void mul_g(const u32 k[8], const u32* gtab, u32 ax[8], u32 ay[8]) {
     u32 X[8], Y[8], Z[8];
     int inf;
@@ -298,7 +298,7 @@ __device__ void mul_g(const u32 k[8], const u32* gtab, u32 ax[8], u32 ay[8]) {
 }
 
 // ------------------------------------------------------------------
-// SHA256（支持 <= 119 字节的小消息，1-2 个块）
+// SHA256 <= 119 1-2 
 // ------------------------------------------------------------------
 __device__ __forceinline__ u32 rotr32(u32 x, int n) { return (x >> n) | (x << (32 - n)); }
 
@@ -367,7 +367,7 @@ __device__ void sha256_small(const unsigned char* msg, int len, unsigned char ou
 }
 
 // ------------------------------------------------------------------
-// RIPEMD160（输入固定 32 字节 = SHA256 输出，单块）
+// RIPEMD160 32  = SHA256 
 // ------------------------------------------------------------------
 __device__ __forceinline__ u32 rol32(u32 x, int n) { return (x << n) | (x >> (32 - n)); }
 
@@ -379,8 +379,8 @@ __device__ u32 rmd_f(int j, u32 x, u32 y, u32 z) {
     return x ^ (y | ~z);
 }
 
-// RIPEMD160 常量表放 __constant__：kernel 内动态索引时走常量缓存，
-// 避免每线程局部内存副本（函数内 const 数组 + 动态索引 = local memory）。
+// RIPEMD160  __constant__kernel 
+//  const  +  = local memory
 __device__ __constant__ unsigned char RMD_R1[80] = {
     0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
     7,4,13,1,10,6,15,3,12,0,9,5,2,14,11,8,
@@ -410,7 +410,7 @@ __device__ __constant__ u32 RMD_KR[5] = {0x50A28BE6u,0x5C4DD124u,0x6D703EF3u,0x7
 
 __device__ void ripemd160_32(const unsigned char msg[32], unsigned char out[20]) {
 
-    // 单块：32 字节消息 + 0x80 + 0 填充 + 64 位小端位长(256)
+    // 32  + 0x80 + 0  + 64 (256)
     u32 X[16];
     #pragma unroll
     for (int i = 0; i < 8; i++)
@@ -419,7 +419,7 @@ __device__ void ripemd160_32(const unsigned char msg[32], unsigned char out[20])
     X[8] = 0x80u;
     #pragma unroll
     for (int i = 9; i < 14; i++) X[i] = 0;
-    X[14] = 256u;  // 位长 256 bit，小端 64 位：低字在 X[14]
+    X[14] = 256u;  //  256 bit 64  X[14]
     X[15] = 0;
 
     u32 h0 = 0x67452301u, h1 = 0xEFCDAB89u, h2 = 0x98BADCFEu,
@@ -456,7 +456,7 @@ __device__ void hash160_small(const unsigned char* msg, int len, unsigned char o
 }
 
 // ------------------------------------------------------------------
-// 公钥序列化：limb 小端 -> 大端字节序（比特币序列化约定）
+// limb  -> 
 // ------------------------------------------------------------------
 __device__ void limbs_to_be(const u32 v[8], unsigned char out[32]) {
     #pragma unroll
@@ -464,16 +464,16 @@ __device__ void limbs_to_be(const u32 v[8], unsigned char out[32]) {
         out[i] = (unsigned char)(v[7 - (i >> 2)] >> (8 * (3 - (i & 3))));
 }
 
-// 仿射点 -> 3 个 20 字节候选键（h_c / h_u / h_sh）
-// 注：P2TR（BIP-341）需要再做一次 tweak*G 标量乘，v1 不实现。
+//  -> 3  20 h_c / h_u / h_sh
+// P2TRBIP-341 tweak*G v1 
 __device__ void hash3(const u32 ax[8], const u32 ay[8],
                       unsigned char hc[20], unsigned char hu[20],
                       unsigned char hsh[20]) {
     unsigned char pub[65];
-    pub[0] = 0x02u | (ay[0] & 1u);   // 压缩公钥：02/03 || x（大端）
+    pub[0] = 0x02u | (ay[0] & 1u);   // 02/03 || x
     limbs_to_be(ax, pub + 1);
     hash160_small(pub, 33, hc);
-    pub[0] = 0x04u;                  // 未压缩公钥：04 || x || y
+    pub[0] = 0x04u;                  // 04 || x || y
     limbs_to_be(ay, pub + 33);
     hash160_small(pub, 65, hu);
     unsigned char script[22];        // P2SH-P2WPKH redeem script: 0x0014 || h_c
@@ -483,7 +483,7 @@ __device__ void hash3(const u32 ax[8], const u32 ay[8],
     hash160_small(script, 22, hsh);
 }
 
-// 私钥 k -> 3 个候选键（自检用便捷封装）
+//  k -> 3 
 __device__ void derive_hash160(const u32 k[8], const u32* gtab,
                                unsigned char hc[20], unsigned char hu[20],
                                unsigned char hsh[20]) {
@@ -493,7 +493,7 @@ __device__ void derive_hash160(const u32 k[8], const u32* gtab,
 }
 
 // ------------------------------------------------------------------
-// 排序 20 字节键库上的二分查找
+//  20 
 // ------------------------------------------------------------------
 __device__ int db20_contains(const unsigned char* db, u64 n, const unsigned char key[20]) {
     u64 lo = 0, hi = n;
@@ -515,7 +515,7 @@ __device__ int db20_contains(const unsigned char* db, u64 n, const unsigned char
 // Kernels
 // ------------------------------------------------------------------
 
-// 自检 a：域运算对拍。输入每组 16 limb (a||b)，输出 40 limb：
+//  a 16 limb (a||b) 40 limb
 // mul | sqr(a) | add | sub | inv(a)
 extern "C" __global__ void test_field(const u32* in_ab, u32* out, u32 n) {
     u32 idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -530,7 +530,7 @@ extern "C" __global__ void test_field(const u32* in_ab, u32* out, u32 n) {
     fp_inv(o + 32, a);
 }
 
-// 自检 b：k*G 对拍。输入每组 8 limb 私钥，输出 16 limb (x||y)
+//  bk*G  8 limb  16 limb (x||y)
 extern "C" __global__ void test_mulg(const u32* ks, const u32* gtab, u32* out, u32 n) {
     u32 idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
@@ -539,7 +539,7 @@ extern "C" __global__ void test_mulg(const u32* ks, const u32* gtab, u32* out, u
     mul_g(k, gtab, o, o + 8);
 }
 
-// 自检 c：hash160 对拍。输出每组 60 字节 (h_c || h_u || h_sh)
+//  chash160  60  (h_c || h_u || h_sh)
 extern "C" __global__ void test_hashes(const u32* ks, const u32* gtab,
                                        unsigned char* out, u32 n) {
     u32 idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -549,7 +549,7 @@ extern "C" __global__ void test_hashes(const u32* ks, const u32* gtab,
     derive_hash160(k, gtab, o, o + 20, o + 40);
 }
 
-// 候选私钥 kj = k0 + j（mod N，j < 2^32）。返回 0 表示该候选无效（wrap 到 0，跳过）。
+//  kj = k0 + jmod Nj < 2^32 0 wrap  0
 __device__ int cand_key(u32 kj[8], const u32 k0[8], u32 j) {
     u64 c = (u64)j;
     #pragma unroll
@@ -557,12 +557,12 @@ __device__ int cand_key(u32 kj[8], const u32 k0[8], u32 j) {
         u64 t = (u64)k0[i] + c;
         kj[i] = (u32)t; c = t >> 32;
     }
-    // k0 < N 且 j 小，k0+j < 2^256，c 必为 0
-    if (fp_geq_n(kj)) fp_sub_n(kj);   // k0+j 最多跨 N 一次
-    return !fp_iszero(kj);            // k0+j ≡ 0 (mod N)：点为无穷远，跳过
+    // k0 < N  j k0+j < 2^256c  0
+    if (fp_geq_n(kj)) fp_sub_n(kj);   // k0+j  N 
+    return !fp_iszero(kj);            // k0+j  0 (mod N)
 }
 
-// 命中记录
+// 
 __device__ void record_hit(const u32 kj[8], u32 cand, u32* hit_count,
                            u32* hits, u32 max_hits) {
     u32 pos = atomicAdd(hit_count, 1u);
@@ -574,20 +574,20 @@ __device__ void record_hit(const u32 kj[8], u32 cand, u32* hit_count,
     }
 }
 
-// 步进扫描核心：从 k0*G（Jacobian）出发，逐部 P += G，Montgomery 批量求逆后
-// 逐候选处理。process=1 时算 hash+查库；process=0 只转仿射（预留）。
-// out60 非 NULL 时把每候选 60B (h_c||h_u||h_sh) 写出（自检用，不查库）。
+//  k0*GJacobian P += GMontgomery 
+// process=1  hash+process=0 
+// out60  NULL  60B (h_c||h_u||h_sh) 
 __device__ void stride_scan(const u32 k0[8], const u32* gtab,
                             const unsigned char* db20, u64 n20,
                             u32* hit_count, u32* hits, u32 max_hits,
                             unsigned char* out60) {
-    const u32* G = gtab + 16;  // 窗口0 digit1 即生成点 G（仿射 x||y）
+    const u32* G = gtab + 16;  // 0 digit1  G x||y
     u32 X[8], Y[8], Z[8];
     int inf;
     jac_mul_g(k0, gtab, X, Y, Z, &inf);
 
-    // 前向：存储 S 个 Jacobian 点并累积 Z 的前缀积
-    u32 XS[STRIDE * 8], YS[STRIDE * 8], ZS[STRIDE * 8], PS[STRIDE * 8];  // 16KB/线程@S=128
+    //  S  Jacobian  Z 
+    u32 XS[STRIDE * 8], YS[STRIDE * 8], ZS[STRIDE * 8], PS[STRIDE * 8];  // 16KB/@S=128
     u32 acc[8] = {1u, 0, 0, 0, 0, 0, 0, 0};
     #pragma unroll 1
     for (int j = 0; j < STRIDE; j++) {
@@ -599,12 +599,12 @@ __device__ void stride_scan(const u32 k0[8], const u32* gtab,
         #pragma unroll
         for (int i = 0; i < 8; i++) PS[j * 8 + i] = acc[i];
         if (j < STRIDE - 1) jac_add_mixed(X, Y, Z, &inf, G, G + 8);
-        // 注：若 k0+(j+1) ≡ 0 (mod N)，点恰为无穷远（inf=1，X/Y/Z 保留旧值，
-        // Z 非零不影响批量求逆）；下一步 add 会从 inf 恢复为 G，扫描自愈。
-        // 该候选由 cand_key 的零检查跳过。
+        //  k0+(j+1)  0 (mod N)inf=1X/Y/Z 
+        // Z  add  inf  G
+        //  cand_key 
     }
 
-    // Montgomery 批量求逆：1 次 fp_inv + 每候选 2 次 fp_mul
+    // Montgomery 1  fp_inv +  2  fp_mul
     u32 t[8];
     fp_inv(t, acc);
     #pragma unroll 1
@@ -617,13 +617,13 @@ __device__ void stride_scan(const u32 k0[8], const u32* gtab,
             #pragma unroll
             for (int i = 0; i < 8; i++) zi[i] = t[i];
         }
-        // 转仿射
+        // 
         u32 zi2[8], ax[8], ay[8];
         fp_sqr(zi2, zi);
         fp_mul(ax, XS + j * 8, zi2);
         fp_mul(ay, YS + j * 8, zi2);
         fp_mul(ay, ay, zi);
-        // 候选私钥 kj = k0 + j (mod N)，0 跳过
+        //  kj = k0 + j (mod N)0 
         u32 kj[8];
         if (!cand_key(kj, k0, (u32)j)) {
             if (out60) {
@@ -643,14 +643,14 @@ __device__ void stride_scan(const u32 k0[8], const u32* gtab,
             }
             continue;
         }
-        if (n20 == 0) continue;  // bench 模式：纯生成不查库
+        if (n20 == 0) continue;  // bench 
         if (db20_contains(db20, n20, hc))  record_hit(kj, 0, hit_count, hits, max_hits);
         if (db20_contains(db20, n20, hu))  record_hit(kj, 1, hit_count, hits, max_hits);
         if (db20_contains(db20, n20, hsh)) record_hit(kj, 2, hit_count, hits, max_hits);
     }
 }
 
-// 自检 c2：步进扫描对拍。每线程输出 STRIDE x 60B（跳过的候选全 0）
+//  c2 STRIDE x 60B 0
 extern "C" __global__ void test_stride(const u32* ks, const u32* gtab,
                                        unsigned char* out, u32 nthreads) {
     u32 idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -659,7 +659,7 @@ extern "C" __global__ void test_stride(const u32* ks, const u32* gtab,
                 out + (size_t)idx * STRIDE * 60);
 }
 
-// 正式碰撞：随机起点 + 步进扫描 + Montgomery 批量求逆
+//  +  + Montgomery 
 extern "C" __global__ void hunt(const u32* ks, const u32* gtab,
                                 const unsigned char* db20, u64 n20,
                                 u32* hit_count, u32* hits, u32 max_hits, u32 nthreads) {

@@ -45,6 +45,7 @@ def compile_cuda(stride=1):
     import cupy as cp
 
     source = CUDA_SRC.replace("// @STRIDE_DEFINE@", f"#define STRIDE {stride}")
+    source = source.encode("ascii", "ignore").decode("ascii")  # NVRTC writes sources as ASCII
     # CuPy injects its own --gpu-architecture for the active device, so we must
     # not pass -arch ourselves; the PTX fallback is for older toolchains.
     errors = []
