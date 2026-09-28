@@ -11,11 +11,14 @@ from v8_random import RandomBaseE1, e1_seed_words  # noqa: E402
 
 
 class _Page:
-    """One (seed, context_index, math_offset, t1, t2, rc4_offset) hypothesis."""
+    """One (seed OR recovered state, math_offset, t1, t2, rc4_offset) hypothesis."""
 
-    def __init__(self, seed, context_index, math_offset, t1, t2, rc4_offset):
-        words = e1_seed_words(seed, context_index)
-        generator = RandomBaseE1(words[0], words[1])
+    def __init__(self, seed, context_index, math_offset, t1, t2, rc4_offset, state_words=None):
+        if state_words is not None:
+            generator = RandomBaseE1(state_words[0], state_words[1])
+        else:
+            words = e1_seed_words(seed, context_index)
+            generator = RandomBaseE1(words[0], words[1])
         for _ in range(math_offset):
             generator.next_u32()
         draws = iter([generator.next_u32() for _ in range(128)])
@@ -53,8 +56,13 @@ def generate_reference(params, t1_array, dt2_array, start, count):
         t2 = (t1 + dt2_array[dt2_idx]) & 0xFFFFFFFF
         current = (seed, t1_idx, dt2_idx)
         if current != page_key:
-            page = _Page(seed, params["context_index"], params.get("math_offset", 0),
-                         t1, t2, params.get("rc4_offset", 0))
+            if params.get("mode", 0) == 1:
+                page = _Page(0, 0, params.get("math_offset", 0), t1, t2,
+                             params.get("rc4_offset", 0),
+                             state_words=(params["mwc_s0"], params["mwc_s1"]))
+            else:
+                page = _Page(seed, params["context_index"], params.get("math_offset", 0),
+                             t1, t2, params.get("rc4_offset", 0))
             for _ in range(key_idx):
                 page.next_key_hex()
             page_key = current

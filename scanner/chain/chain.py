@@ -21,6 +21,9 @@ class RsParams(ctypes.Structure):
         ("key_count", ctypes.c_uint32),
         ("rc4_offset", ctypes.c_uint32),
         ("seed_count", ctypes.c_uint64),
+        ("mode", ctypes.c_uint32),
+        ("mwc_s0", ctypes.c_uint32),
+        ("mwc_s1", ctypes.c_uint32),
     ]
 
 
@@ -73,6 +76,9 @@ def generate(params, t1_array, dt2_array, start, count):
         key_count=params["key_count"],
         rc4_offset=params.get("rc4_offset", 0),
         seed_count=params["seed_count"],
+        mode=params.get("mode", 0),
+        mwc_s0=params.get("mwc_s0", 0),
+        mwc_s1=params.get("mwc_s1", 0),
     )
     t1 = (ctypes.c_uint32 * len(t1_array))(*t1_array)
     dt2 = (ctypes.c_uint32 * len(dt2_array))(*dt2_array)

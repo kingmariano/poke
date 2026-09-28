@@ -33,7 +33,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install Modal client
-        run: pip install modal
+        run: pip install modal z3-solver
       - name: Run on Modal GPU
         env:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}

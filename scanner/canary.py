@@ -92,8 +92,59 @@ def build_canary_index(victims_bytes):
     return index_bytes, expected
 
 
+# ---- recovered-state canaries (no seed enumeration) -------------------------
+
+STATE_T1 = 0x4E0B2C40
+STATE_CANARIES = [
+    # (label, key_index, dt2, rc4_offset, hash_type)
+    ("state/compressed", 1, 0, 0, 0),
+    ("state/uncompressed", 0, 500, 0, 1),
+    ("state/p2sh@offset33", 2, 0, 33, 2),
+]
+
+
+def build_state_canary(victims_bytes, state_words, leak_count, t1=STATE_T1):
+    """Merge canary wallets generated from a *recovered* random_base state."""
+    records = {victims_bytes[i:i + 20] for i in range(0, len(victims_bytes), 20)}
+    expected = {}
+    for label, key_index, dt2, rc4_offset, hash_type in STATE_CANARIES:
+        page = _Page(0, 0, leak_count, t1, t1 + dt2, rc4_offset, state_words=state_words)
+        key_hex = None
+        for _ in range(key_index + 1):
+            key_hex = page.next_key_hex()
+        digest = hash_for_type(int(key_hex, 16), hash_type)
+        records.add(digest)
+        expected[digest.hex()] = {
+            "label": label,
+            "math_offset": leak_count,
+            "t1": t1,
+            "dt2": dt2,
+            "key_index": key_index,
+            "rc4_offset": rc4_offset,
+            "hash_type": hash_type,
+            "private_key": key_hex,
+        }
+    return b"".join(sorted(records)), expected
+
+
+def state_canary_config(state_words, leak_count, t1=STATE_T1, window=50):
+    return {
+        "id": "state-canary",
+        "note": "recovered-state campaign: only the time grid is enumerated",
+        "mode": "state",
+        "mwc_s0": int(state_words[0]),
+        "mwc_s1": int(state_words[1]),
+        "t1_values": [t1 - window + i for i in range(2 * window + 1)],
+        "dt2_values": [0, 500],
+        "key_count": 3,
+        "context_indexes": [0],
+        "math_offsets": [int(leak_count)],
+        "rc4_offsets": [0, 33],
+        "shard_keys": 5000,
+    }
+
+
 def verify_hits(scan_state, campaign_id, expected):
-    """Check that every canary hash appears as a hit in the stored shard results."""
     found = {}
     for shard_id in sorted(scan_state.list_shard_results(campaign_id)):
         result = scan_state.read_json(f"campaigns/{campaign_id}/shards/{shard_id}.json")

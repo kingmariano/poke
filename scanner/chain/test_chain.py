@@ -63,6 +63,12 @@ def main():
               "key_count": 1, "rc4_offset": 0, "seed_count": 2}
     run_case(params, [0], [0], "edge wrap seed / single key")
 
+    # state mode: recovered random_base words, no seed enumeration
+    params_state = {"seed_start": 0, "context_index": 0, "math_offset": 3,
+                    "key_count": 2, "rc4_offset": 1, "seed_count": 1,
+                    "mode": 1, "mwc_s0": 0xDEADBEEF, "mwc_s1": 0x12345678}
+    run_case(params_state, [0x4E0B2C40], [7], "state mode")
+
     print("ALL CHAIN DIFFERENTIAL TESTS PASSED")
 
 

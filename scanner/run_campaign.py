@@ -40,11 +40,13 @@ def enumerate_shards(config):
     """Deterministic shard list for the campaign axes."""
     shards = []
     shard_keys = int(config.get("shard_keys", 4_000_000))
+    state_mode = config.get("mode") == "state"
+    seed_count = 1 if state_mode else int(config.get("seed_count", 0))
     for context in config.get("context_indexes", [0]):
         for math_offset in config.get("math_offsets", [0]):
             for rc4_offset in config.get("rc4_offsets", [config.get("rc4_offset", 0)]):
                 total = (
-                    int(config.get("seed_count", 0))
+                    seed_count
                     * len(config.get("t1_values", []))
                     * len(config.get("dt2_values", []))
                     * int(config.get("key_count", 1))
@@ -52,10 +54,10 @@ def enumerate_shards(config):
                 start = 0
                 while start < total:
                     count = min(shard_keys, total - start)
-                    shards.append({
+                    shard = {
                         "shard_id": f"c{context}-m{math_offset}-o{rc4_offset}-{start}-{count}",
-                        "seed_start": int(config["seed_start"]),
-                        "seed_count": int(config["seed_count"]),
+                        "seed_start": int(config.get("seed_start", 0)),
+                        "seed_count": seed_count,
                         "context_index": int(context),
                         "math_offset": int(math_offset),
                         "key_count": int(config["key_count"]),
@@ -64,7 +66,12 @@ def enumerate_shards(config):
                         "dt2_values": [int(v) for v in config["dt2_values"]],
                         "flat_start": start,
                         "flat_count": count,
-                    })
+                    }
+                    if state_mode:
+                        shard["mode"] = 1
+                        shard["mwc_s0"] = int(config["mwc_s0"])
+                        shard["mwc_s1"] = int(config["mwc_s1"])
+                    shards.append(shard)
                     start += count
     return shards
 

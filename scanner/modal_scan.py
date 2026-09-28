@@ -27,7 +27,7 @@ CUDA_BASE = "nvidia/cuda:12.4.1-devel-ubuntu22.04"
 
 image = (
     modal.Image.from_registry(CUDA_BASE, add_python="3.11")
-    .pip_install("numpy", "cupy-cuda12x")
+    .pip_install("numpy", "cupy-cuda12x", "z3-solver")
     .add_local_dir("scanner", remote_path="/root/scanner", copy=True)
     .run_commands(
         "gcc -O3 -shared -fPIC -o /root/scanner/chain/librandstorm_chain.so "
@@ -108,6 +108,9 @@ def run_shard(spec_json: str, index_bytes: bytes, budget_seconds: int = 900):
         "math_offset": spec["math_offset"],
         "key_count": spec["key_count"],
         "rc4_offset": spec["rc4_offset"],
+        "mode": spec.get("mode", 0),
+        "mwc_s0": spec.get("mwc_s0", 0),
+        "mwc_s1": spec.get("mwc_s1", 0),
     }
     t1_values = spec["t1_values"]
     dt2_values = spec["dt2_values"]
@@ -188,6 +191,30 @@ def main(task: str = "selftest", campaign: str = "", max_shards: int = 1, budget
         import scan_state
 
         canary.verify_hits(scan_state, "canary", expected)
+    elif task == "state_canary":
+        import canary
+        import run_campaign
+        import state_recovery
+
+        true_s0, true_s1 = 0xDEADBEEF, 0x12345678
+        leaked = state_recovery.simulate_outputs(true_s0, true_s1, 4)
+        recovered = state_recovery.recover_state(leaked)
+        assert state_recovery.verify_recovery(true_s0, true_s1, recovered, extra=64), "recovery failed"
+        print(f"state recovered from {len(leaked)} leaked outputs: {recovered[0]:08x} {recovered[1]:08x}")
+
+        victims = run_campaign.fetch_victims_index()
+        index_bytes, expected = canary.build_state_canary(victims, recovered, leak_count=len(leaked))
+        print(f"state canary index: {len(index_bytes):,} bytes, {len(expected)} records")
+        run_campaign.run_campaign(
+            canary.state_canary_config(recovered, leak_count=len(leaked)),
+            max_shards=100,
+            budget_seconds=budget_seconds,
+            run_shard=run_shard,
+            index_bytes=index_bytes,
+        )
+        import scan_state
+
+        canary.verify_hits(scan_state, "state-canary", expected)
     elif task in ("campaign", "campaign_init", "campaign_status"):
         import run_campaign
 
