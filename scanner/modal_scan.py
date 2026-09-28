@@ -27,15 +27,11 @@ CUDA_BASE = "nvidia/cuda:12.4.1-devel-ubuntu22.04"
 image = (
     modal.Image.from_registry(CUDA_BASE, add_python="3.11")
     .pip_install("numpy", "cupy-cuda12x")
-    .add_local_dir("scanner", remote_path="/root/scanner")
+    .add_local_dir("scanner", remote_path="/root/scanner", copy=True)
     .run_commands(
         "gcc -O3 -shared -fPIC -o /root/scanner/chain/librandstorm_chain.so "
         "/root/scanner/chain/randstorm_chain.c",
-        "python - <<'PY'\n"
-        "import sys; sys.path.insert(0, '/root/scanner'); sys.path.insert(0, '/root/scanner/chain')\n"
-        "import chain; chain.build(force=True)\n"
-        "print('chain library ready')\n"
-        "PY",
+        "ls -la /root/scanner/chain/librandstorm_chain.so",
     )
 )
 
