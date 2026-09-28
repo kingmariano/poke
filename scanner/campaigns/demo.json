@@ -1,0 +1,13 @@
+{
+  "id": "demo",
+  "note": "plumbing demonstration: 16.7M seeds x 1 page-load time x 1 key; not a real target run",
+  "seed_start": 0,
+  "seed_count": 16777216,
+  "context_indexes": [0, 1],
+  "math_offsets": [0],
+  "t1_values": [1300000000000],
+  "dt2_values": [0],
+  "key_count": 1,
+  "rc4_offset": 0,
+  "shard_keys": 4000000
+}
