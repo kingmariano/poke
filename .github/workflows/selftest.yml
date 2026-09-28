@@ -1,0 +1,30 @@
+name: rng-selftest
+
+on:
+  push:
+    paths:
+      - "scanner/**"
+      - ".github/workflows/selftest.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rng-selftest
+  cancel-in-progress: true
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: RNG chain known-answer tests
+        run: |
+          python scanner/glibc_random.py
+          python scanner/ec.py
+          python scanner/test_scanner.py
