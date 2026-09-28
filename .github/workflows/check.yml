@@ -63,13 +63,17 @@ jobs:
       - name: Quick validation run
         env:
           ALCHEMY_API_KEY: ${{ secrets.ALCHEMY_API_KEY }}
+          DRPC_API_KEY: ${{ secrets.DRPC_API_KEY }}
+          ANKR_API_KEY: ${{ secrets.ANKR_API_KEY }}
+          INFURA_API_KEY: ${{ secrets.INFURA_API_KEY }}
+          NODEREAL_ETH_RPC_URL: ${{ secrets.NODEREAL_ETH_RPC_URL }}
         run: |
           mkdir -p smoke
           python tools/check_balances.py --shard shards/shard-00.txt.gz \
             --out smoke/check.csv --stats smoke/check.json \
             --networks eth-mainnet,base-mainnet,arb-mainnet \
             --token-networks eth-mainnet,base-mainnet \
-            --limit 5 --rps 5 --max-rate 10 --concurrency 3 --batch 5 --token-batch 5
+            --limit 5 --native-batch 5 --native-concurrency 3 --token-batch 5 --token-concurrency 2 --token-rate 4
           python - <<'PY'
           import json
           s = json.load(open("smoke/check.json"))
@@ -106,6 +110,10 @@ jobs:
       - name: Check balances
         env:
           ALCHEMY_API_KEY: ${{ secrets.ALCHEMY_API_KEY }}
+          DRPC_API_KEY: ${{ secrets.DRPC_API_KEY }}
+          ANKR_API_KEY: ${{ secrets.ANKR_API_KEY }}
+          INFURA_API_KEY: ${{ secrets.INFURA_API_KEY }}
+          NODEREAL_ETH_RPC_URL: ${{ secrets.NODEREAL_ETH_RPC_URL }}
         run: |
           SHARD=$(printf '%02d' ${{ matrix.shard }})
           mkdir -p results
@@ -114,8 +122,10 @@ jobs:
               --shard "shards/shard-$SHARD.txt.gz" \
               --out "results/shard-${{ matrix.shard }}.csv" \
               --stats "results/shard-${{ matrix.shard }}.json" \
-              --rps 15 --max-rate 60 --concurrency 8 --batch 100 --token-batch 50 && break
-            echo "attempt $attempt failed; retrying in 90s"; sleep 90
+              --native-batch 50 --native-concurrency 16 \
+              --token-batch 50 --token-concurrency 4 \
+              --token-rate 18 --token-max-rate 40 --max-seconds 18000 && break
+            echo "attempt $attempt failed; retrying in 60s"; sleep 60
           done
           test -s "results/shard-${{ matrix.shard }}.csv" || { echo "no results produced"; exit 1; }
           python - <<'PY'

@@ -1,16 +1,16 @@
-"""Check balances for one address shard across EVM networks.
+"""Check balances for one address shard across the top EVM networks.
 
-For each network in the registry:
-  * native balances via batched JSON-RPC
-  * ERC-20 balances via the provider's token-balance endpoint (batched)
+Native balances: general-purpose RPC providers (failover across endpoints).
+ERC-20 balances: the dedicated token provider.
 
 Robustness:
-  * preflight verifies each network (and token support) and skips unavailable ones
-  * adaptive rate limiting (token bucket; backs off on 429, recovers slowly)
-  * bounded concurrency, retries with exponential backoff
-  * results are written progressively per network, so partial progress survives
+  * endpoint failover for native calls
+  * bounded concurrency + adaptive backoff on 429
+  * progressive per-network writes (partial progress always preserved)
+  * resumable: if a per-network output already exists, that network is skipped
 
-Output: CSV (address, network, native_wei, token_count, tokens) + stats JSON.
+Output: results/<shard>.csv (address, network, native_wei, token_count, tokens)
+        results/<shard>.json (stats, including per-network progress)
 """
 
 import argparse
@@ -25,17 +25,17 @@ from typing import Dict, List, Optional
 
 import aiohttp
 
-try:  # allow execution as a plain script and as a module
+try:
     from .networks import NETWORKS, TOKEN_CANDIDATES
+    from .providers import native_urls, token_url
 except ImportError:  # pragma: no cover
     from networks import NETWORKS, TOKEN_CANDIDATES
+    from providers import native_urls, token_url
 
-PROBE_ADDRESS = "0x28C6c06298d514Db089934071355E5743bf21d60"
+RETRIES = 5
 
 
 class Limit:
-    """Adaptive token bucket."""
-
     def __init__(self, rate: float, max_rate: float):
         self.rate = rate
         self.max_rate = max_rate
@@ -59,109 +59,49 @@ class Limit:
     async def backoff(self):
         async with self.lock:
             self.throttled += 1
-            self.rate = max(0.25, self.rate / 2)
+            self.rate = max(0.5, self.rate / 2)
             self.tokens = 0.0
 
     async def recover(self):
         async with self.lock:
             if self.rate < self.max_rate:
-                self.rate = min(self.max_rate, self.rate * 1.05)
+                self.rate = min(self.max_rate, self.rate * 1.02)
 
 
-class Rpc:
-    def __init__(self, session, key, limiter, retries=6):
-        self.session = session
-        self.key = key
-        self.limiter = limiter
-        self.retries = retries
-        self.stats = {"requests": 0, "throttled": 0, "errors": 0}
-
-    async def batch(self, network: str, calls: List[dict]) -> Optional[List[dict]]:
-        url = f"https://{network}.g.alchemy.com/v2/{self.key}"
-        payload = [dict(c, jsonrpc="2.0", id=i) for i, c in enumerate(calls)]
-        for attempt in range(self.retries):
-            await self.limiter.acquire()
+async def batch_call(session, urls: List[str], calls: List[dict], state: dict) -> Optional[List[dict]]:
+    """Send a JSON-RPC batch, failing over across urls on error."""
+    payload = [dict(c, jsonrpc="2.0", id=i) for i, c in enumerate(calls)]
+    n = len(calls)
+    for url in urls:
+        for attempt in range(RETRIES):
             try:
-                async with self.session.post(url, json=payload,
-                                             timeout=aiohttp.ClientTimeout(total=90)) as r:
-                    self.stats["requests"] += 1
+                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=45)) as r:
+                    state["requests"] += 1
                     if r.status == 429:
-                        self.stats["throttled"] += 1
-                        await self.limiter.backoff()
-                        await asyncio.sleep(min(30, 2 ** attempt))
+                        state["throttled"] += 1
+                        await asyncio.sleep(0.8 * (attempt + 1))
                         continue
                     if r.status >= 500:
-                        await asyncio.sleep(min(20, 1.5 ** attempt))
+                        await asyncio.sleep(0.6 * (attempt + 1))
                         continue
+                    if r.status != 200:
+                        break  # try next endpoint
                     data = await r.json(content_type=None)
                     if not isinstance(data, list):
-                        await asyncio.sleep(1.5 ** attempt)
-                        continue
-                    out = [None] * len(calls)
+                        break
+                    out = [None] * n
                     for item in data:
                         i = item.get("id")
-                        if isinstance(i, int) and 0 <= i < len(calls):
+                        if isinstance(i, int) and 0 <= i < n:
                             out[i] = item.get("result")
-                    await self.limiter.recover()
-                    return out
-            except (aiohttp.ClientError, asyncio.TimeoutError):
-                self.stats["errors"] += 1
-                await asyncio.sleep(min(20, 1.5 ** attempt))
-        return None
-
-
-async def preflight(session, key, networks, token_networks, limiter):
-    active, active_tokens, skipped = [], set(), {}
-    for net in networks:
-        url = f"https://{net}.g.alchemy.com/v2/{key}"
-        status = None
-        for attempt in range(3):
-            await limiter.acquire()
-            try:
-                async with session.post(url, json={"jsonrpc": "2.0", "id": 1,
-                                                   "method": "eth_chainId", "params": []},
-                                        timeout=aiohttp.ClientTimeout(total=20)) as r:
-                    if r.status == 200:
-                        status = "ok"
-                        break
-                    if r.status == 429:
-                        await asyncio.sleep(5 + attempt * 5)
-                        continue
-                    status = f"http{r.status}"
+                    if all(x is not None for x in out):
+                        state["ok"] += 1
+                        return out
                     break
-            except Exception:  # noqa: BLE001
-                status = "unavailable"
-                break
-        if status in ("ok", "429"):
-            active.append(net)
-            if net in token_networks:
-                ok = False
-                for attempt in range(3):
-                    await limiter.acquire()
-                    try:
-                        async with session.post(url, json={"jsonrpc": "2.0", "id": 1,
-                                                           "method": "alchemy_getTokenBalances",
-                                                           "params": [PROBE_ADDRESS, "erc20"]},
-                                                timeout=aiohttp.ClientTimeout(total=25)) as r:
-                            if r.status == 200:
-                                data = await r.json(content_type=None)
-                                res = data.get("result") if isinstance(data, dict) else None
-                                ok = isinstance(res, dict) and "tokenBalances" in res
-                                break
-                            if r.status == 429:
-                                await asyncio.sleep(5 + attempt * 5)
-                                continue
-                            break
-                    except Exception:  # noqa: BLE001
-                        break
-                if ok:
-                    active_tokens.add(net)
-                else:
-                    skipped[f"{net}:tokens"] = "unsupported"
-        else:
-            skipped[net] = status
-        await asyncio.sleep(0.2)
-    return active, active_tokens, skipped
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                state["errors"] += 1
+                await asyncio.sleep(0.6 * (attempt + 1))
+    return None
 
 
 def read_addresses(path: str, limit: int = 0) -> List[str]:
@@ -169,7 +109,7 @@ def read_addresses(path: str, limit: int = 0) -> List[str]:
     opener = gzip.open if path.endswith(".gz") else open
     with opener(path, "rt") as f:
         for line in f:
-            a = line.strip()
+            a = line.strip().lower()
             if a.startswith("0x") and len(a) == 42:
                 out.append(a)
                 if limit and len(out) >= limit:
@@ -177,86 +117,111 @@ def read_addresses(path: str, limit: int = 0) -> List[str]:
     return out
 
 
-class Output:
-    """Progressive CSV writer (flush per network)."""
+async def run(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--shard", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--stats", default=None)
+    ap.add_argument("--networks", default=",".join(NETWORKS.keys()))
+    ap.add_argument("--token-networks", default=",".join(TOKEN_CANDIDATES))
+    ap.add_argument("--native-batch", type=int, default=50)
+    ap.add_argument("--native-concurrency", type=int, default=16)
+    ap.add_argument("--token-batch", type=int, default=50)
+    ap.add_argument("--token-concurrency", type=int, default=4)
+    ap.add_argument("--token-rate", type=float, default=18.0)
+    ap.add_argument("--token-max-rate", type=float, default=40.0)
+    ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--max-seconds", type=int, default=18000)
+    args = ap.parse_args(argv)
 
-    def __init__(self, path: str):
-        os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
-        self.fh = open(path, "w", newline="")
-        self.w = csv.writer(self.fh)
-        self.w.writerow(["address", "network", "native_wei", "token_count", "tokens"])
-        self.fh.flush()
-
-    def write(self, hits: Dict[str, dict], network: str):
-        for a, rec in hits.items():
-            wei = (rec.get("native") or {}).get(network, 0)
-            toks = (rec.get("tokens") or {}).get(network) or []
-            if wei or toks:
-                desc = "|".join(f"{t}:{v}" for t, v in sorted(toks, key=lambda x: -x[1])[:50])
-                self.w.writerow([a, network, wei, len(toks), desc])
-        self.fh.flush()
-
-    def close(self):
-        self.fh.close()
-
-
-async def run(args):
-    key = os.environ.get("ALCHEMY_API_KEY")
-    if not key:
-        print("missing provider key", file=sys.stderr)
-        return 2
     networks = [n.strip() for n in args.networks.split(",") if n.strip()]
-    for n in networks:
-        if n not in NETWORKS:
-            print(f"unknown network {n}", file=sys.stderr)
-            return 2
-    token_networks = {n.strip() for n in args.token_networks.split(",") if n.strip() and n in NETWORKS}
-
+    token_networks = {n.strip() for n in args.token_networks.split(",") if n.strip()}
     addresses = read_addresses(args.shard, args.limit)
-    out = Output(args.out)
+    a_key = "".join(addresses)  # cheap identity for resume checks
+
     stats = {"shard": os.path.basename(args.shard), "addresses": len(addresses),
-             "native_checks": 0, "token_checks": 0, "networks": {}, "skipped": {},
-             "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-    limiter = Limit(args.rps, args.max_rate)
+             "networks": {}, "skipped": {}, "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
+    new_file = not os.path.exists(args.out)
+    fh = open(args.out, "a", newline="")
+    w = csv.writer(fh)
+    if new_file:
+        w.writerow(["address", "network", "native_wei", "token_count", "tokens"])
+
+    done_nets = set()
+    if args.stats and os.path.exists(args.stats):
+        try:
+            prev = json.load(open(args.stats))
+            if prev.get("addresses") == len(addresses):
+                done_nets = set(prev.get("networks", {}).keys())
+                stats["skipped"] = prev.get("skipped", {})
+                print(f"resuming: {len(done_nets)} networks already complete", flush=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+    all_hits = set()
+    limiter = Limit(args.token_rate, args.token_max_rate)
+    native_state = {"requests": 0, "ok": 0, "throttled": 0, "errors": 0}
+    token_state = {"requests": 0, "ok": 0, "throttled": 0, "errors": 0}
     hits: Dict[str, dict] = {}
+    connector = aiohttp.TCPConnector(limit=64, ttl_dns_cache=300)
 
-    connector = aiohttp.TCPConnector(limit=args.concurrency * 2, ttl_dns_cache=300)
     async with aiohttp.ClientSession(connector=connector) as session:
-        rpc = Rpc(session, key, limiter)
-        print("preflight ...", flush=True)
-        active, active_tokens, skipped = await preflight(session, key, networks, token_networks, limiter)
-        stats["skipped"] = skipped
-        stats["active"] = active
-        stats["active_tokens"] = sorted(active_tokens)
-        print(f"preflight: {len(active)} networks, {len(active_tokens)} token-enabled; "
-              f"skipped {len(skipped)}", flush=True)
+        deadline = time.monotonic() + args.max_seconds
 
-        sem = asyncio.Semaphore(args.concurrency)
+        async def process_network(net):
+            if net in done_nets:
+                return
+            cfg = NETWORKS.get(net)
+            if not cfg:
+                return
+            if time.monotonic() > deadline:
+                stats["skipped"][net] = "time-budget"
+                return
+            t0 = time.time()
+            urls = native_urls(net)
+            if not urls:
+                stats["skipped"][net] = "no-rpc-endpoint"
+                return
+            local: Dict[str, dict] = {}
+            # ---- native ----
+            sem = asyncio.Semaphore(args.native_concurrency)
+            nchunks = [addresses[i:i + args.native_batch] for i in range(0, len(addresses), args.native_batch)]
 
-        async def process(net):
-            async with sem:
-                cfg = NETWORKS[net]
-                t0 = time.time()
-                for i in range(0, len(addresses), args.batch):
-                    chunk = addresses[i:i + args.batch]
-                    res = await rpc.batch(net, [{"method": "eth_getBalance",
-                                                 "params": [a, "latest"]} for a in chunk])
-                    if res:
-                        for a, bal in zip(chunk, res):
-                            if not bal:
-                                continue
-                            try:
-                                v = int(bal, 16)
-                            except Exception:  # noqa: BLE001
-                                continue
-                            if v > 0:
-                                hits.setdefault(a, {}).setdefault("native", {})[net] = v
-                    stats["native_checks"] += len(chunk)
-                if net in active_tokens:
-                    for i in range(0, len(addresses), args.token_batch):
-                        chunk = addresses[i:i + args.token_batch]
-                        res = await rpc.batch(net, [{"method": "alchemy_getTokenBalances",
-                                                     "params": [a, "erc20"]} for a in chunk])
+            async def do_native(chunk):
+                async with sem:
+                    res = await batch_call(session, urls,
+                                           [{"method": "eth_getBalance", "params": [a, "latest"]} for a in chunk],
+                                           native_state)
+                if res:
+                    for a, bal in zip(chunk, res):
+                        if not bal:
+                            continue
+                        try:
+                            v = int(bal, 16)
+                        except Exception:  # noqa: BLE001
+                            continue
+                        if v > 0:
+                            local.setdefault(a, {}).setdefault("native", {})[net] = v
+                stats["native_checked"] = stats.get("native_checked", 0) + len(chunk)
+
+            for i in range(0, len(nchunks), args.native_concurrency * 4):
+                if time.monotonic() > deadline:
+                    break
+                await asyncio.gather(*(do_native(c) for c in nchunks[i:i + args.native_concurrency * 4]))
+            # ---- tokens ----
+            if net in token_networks and time.monotonic() < deadline:
+                turl = token_url(net)
+                if turl:
+                    tsem = asyncio.Semaphore(args.token_concurrency)
+                    tchunks = [addresses[i:i + args.token_batch] for i in range(0, len(addresses), args.token_batch)]
+
+                    async def do_tokens(chunk):
+                        async with tsem:
+                            await limiter.acquire()
+                            res = await batch_call(session, [turl],
+                                                   [{"method": "alchemy_getTokenBalances",
+                                                     "params": [a, "erc20"]} for a in chunk], token_state)
                         if res:
                             for a, item in zip(chunk, res):
                                 if not isinstance(item, dict):
@@ -270,48 +235,51 @@ async def run(args):
                                     if amt > 0:
                                         toks.append((tb.get("contractAddress", "").lower(), amt))
                                 if toks:
-                                    hits.setdefault(a, {}).setdefault("tokens", {})[net] = toks
-                        stats["token_checks"] += len(chunk)
-                out.write(hits, net)
-                stats["networks"][net] = {
-                    "seconds": round(time.time() - t0, 1),
-                    "native_checks": len(addresses),
-                    "token_checks": len(addresses) if net in active_tokens else 0,
-                }
-                print(f"  {net}: done in {stats['networks'][net]['seconds']}s", flush=True)
+                                    local.setdefault(a, {}).setdefault("tokens", {})[net] = toks
+                        stats["token_checked"] = stats.get("token_checked", 0) + len(chunk)
 
-        for net in active:
-            await process(net)
+                    for i in range(0, len(tchunks), args.token_concurrency * 4):
+                        if time.monotonic() > deadline:
+                            break
+                        await asyncio.gather(*(do_tokens(c) for c in tchunks[i:i + args.token_concurrency * 4]))
+            # ---- write network results ----
+            for a, rec in local.items():
+                all_hits.add(a)
+                wei = (rec.get("native") or {}).get(net, 0)
+                toks = (rec.get("tokens") or {}).get(net) or []
+                if wei or toks:
+                    desc = "|".join(f"{t}:{v}" for t, v in sorted(toks, key=lambda x: -x[1])[:50])
+                    w.writerow([a, net, wei, len(toks), desc])
+            fh.flush()
+            stats["networks"][net] = {
+                "seconds": round(time.time() - t0, 1),
+                "native_checked": len(addresses),
+                "token_checked": len(addresses) if net in token_networks else 0,
+                "hits": len(local),
+            }
+            if args.stats:
+                with open(args.stats, "w") as f:
+                    json.dump(stats, f, indent=1)
+            print(f"  {net}: {stats['networks'][net]['seconds']}s "
+                  f"(native {native_state['ok']} ok/{native_state['throttled']} 429, "
+                  f"token {token_state['ok']} ok/{token_state['throttled']} 429)", flush=True)
 
-    out.close()
-    stats["rate_final"] = round(limiter.rate, 2)
-    stats["throttled"] = limiter.throttled
-    stats["rpc"] = rpc.stats
+        await asyncio.gather(*(process_network(n) for n in networks))
+
+    fh.close()
+    stats["native"] = native_state
+    stats["token"] = token_state
     stats["finished"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    stats["addresses_with_balance"] = len(hits)
+    stats["addresses_with_balance"] = len(all_hits)
     if args.stats:
-        os.makedirs(os.path.dirname(os.path.abspath(args.stats)) or ".", exist_ok=True)
         with open(args.stats, "w") as f:
             json.dump(stats, f, indent=1)
-    print(json.dumps({k: v for k, v in stats.items() if k != "networks"}, indent=1))
+    print(json.dumps({k: v for k, v in stats.items() if k != "networks"}, indent=1), flush=True)
     return 0
 
 
-def main(argv=None):
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--shard", required=True)
-    ap.add_argument("--out", required=True)
-    ap.add_argument("--stats", default=None)
-    ap.add_argument("--networks", default=",".join(NETWORKS.keys()))
-    ap.add_argument("--token-networks", default=",".join(TOKEN_CANDIDATES))
-    ap.add_argument("--rps", type=float, default=15.0)
-    ap.add_argument("--max-rate", type=float, default=60.0)
-    ap.add_argument("--concurrency", type=int, default=8)
-    ap.add_argument("--batch", type=int, default=100)
-    ap.add_argument("--token-batch", type=int, default=50)
-    ap.add_argument("--limit", type=int, default=0)
-    args = ap.parse_args(argv)
-    return asyncio.run(run(args))
+def main():
+    return asyncio.run(run())
 
 
 if __name__ == "__main__":
