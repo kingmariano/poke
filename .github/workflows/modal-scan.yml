@@ -43,5 +43,5 @@ jobs:
           python -m modal run scanner/modal_scan.py::main \
             --task "${{ inputs.task }}" \
             --campaign "${{ inputs.campaign }}" \
-            --max_shards "${{ inputs.max_shards }}" \
-            --budget_seconds "${{ inputs.budget_seconds }}"
+            --max-shards "${{ inputs.max_shards }}" \
+            --budget-seconds "${{ inputs.budget_seconds }}"
